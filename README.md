@@ -243,26 +243,18 @@ SELECT value_to_jsonb('\x9000ff');
 -- ERROR: pg_ilib value_to_jsonb: unknown op_id 0x09
 ```
 
-## Related extensions (same repository)
-
-| Extension | Description |
-|-----------|-------------|
-| `pg_tmpl` | Mustache template rendering (`tmpl_render`) |
-| `pg_curl` | HTTP / WebSocket / Telegram Bot API |
-
-Build each independently:
-
-```bash
-make -f Makefile.tmpl && sudo make -f Makefile.tmpl install
-make -f Makefile.curl && sudo make -f Makefile.curl install
-```
-
 Or build all three at once:
 
 ```bash
 make all-ext && sudo make install-ext
 ```
 
+## Background
+
+pg_ilib was extracted from [LedgyX](https://ledgyx.com) — a low-code API platform that generates FastAPI applications directly from PostgreSQL schemas. Inside LedgyX, pg_ilib powers all dynamic typed-column storage: every schemaless attribute, every versioned record, and every cross-type comparison goes through this format in production.
+
+We open-sourced it because the problem it solves — carrying type information inside `bytea` without a separate metadata column — is useful well beyond LedgyX itself.
+
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](./LICENSE).
