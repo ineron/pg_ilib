@@ -1,0 +1,5 @@
+comment     = 'Typed binary serialization: *_to_bytea / bytea_to_* / value_to_jsonb'
+default_version = '1.5'
+module_pathname = '$libdir/pg_ilib'
+relocatable = true
+requires    = ''
