@@ -185,6 +185,72 @@ SELECT value_to_jsonb(str_to_bytea('hello world')) AS test_text_json_params_zero
 -- ============================================================
 
 -- ============================================================
+-- bigint_to_bytea / bytea_to_bigint roundtrip
+-- (bug fix 2026-08-03: header was 1 byte with no params field and an
+--  uninitialized trailing magnitude byte, so pg_ilib's own decoder
+--  couldn't read pg_ilib's own encoder's output — see git history)
+-- ============================================================
+\echo '--- bigint_to_bytea / bytea_to_bigint roundtrip ---'
+
+-- 1. Original bug repro: used to ERROR with
+--    "numeric scale 30 is impossible for 1 payload byte(s)"
+DO $$
+BEGIN
+  IF bytea_to_bigint(bigint_to_bytea(30::bigint)) != 30 THEN
+    RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/bytea_to_bigint roundtrip for 30';
+  END IF;
+  RAISE NOTICE 'OK: bigint_to_bytea/bytea_to_bigint roundtrip for 30';
+END $$;
+
+-- 2. Roundtrip across every magnitude-byte-count boundary (0, 1, 2, 3, 4 bytes)
+DO $$
+DECLARE
+  v bigint;
+  vals bigint[] := ARRAY[0, 1, 255, 256, 65535, 65536, 16777215, 16777216, 12345, 72057594037927935];
+BEGIN
+  FOREACH v IN ARRAY vals LOOP
+    IF bytea_to_bigint(bigint_to_bytea(v)) != v THEN
+      RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/bytea_to_bigint roundtrip for %', v;
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'OK: bigint_to_bytea/bytea_to_bigint roundtrip for % values', array_length(vals, 1);
+END $$;
+
+-- 3. Header/payload must be byte-for-byte identical to numeric_to_bytea
+--    for the same value+scale (the two encoders must share one convention)
+DO $$
+BEGIN
+  IF encode(bigint_to_bytea(12345::bigint, 2), 'hex') != encode(numeric_to_bytea(12345, 2), 'hex') THEN
+    RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/numeric_to_bytea byte-layout parity (12345, scale 2)';
+  END IF;
+  IF encode(bigint_to_bytea(0::bigint, 0), 'hex') != encode(numeric_to_bytea(0, 0), 'hex') THEN
+    RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/numeric_to_bytea byte-layout parity (0)';
+  END IF;
+  RAISE NOTICE 'OK: bigint_to_bytea matches numeric_to_bytea byte layout';
+END $$;
+
+-- 4. Scale argument must be honored, not silently dropped: bigint encoded
+--    with scale=2 must decode via bytea_to_numeric as a scaled decimal
+DO $$
+BEGIN
+  IF bytea_to_numeric(bigint_to_bytea(12345::bigint, 2)) != 123.45 THEN
+    RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea did not honor scale argument';
+  END IF;
+  RAISE NOTICE 'OK: bigint_to_bytea honors scale argument';
+END $$;
+
+-- 5. Value exceeding 7 magnitude bytes (56 bits) must ERROR, not
+--    silently return NULL
+DO $$
+BEGIN
+  PERFORM bigint_to_bytea(9223372036854775807::bigint);
+  RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea should have rejected an oversized value';
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'OK: bigint_to_bytea rejected oversized value: %', SQLERRM;
+END $$;
+-- ============================================================
+
+-- ============================================================
 -- Validation / anti-crash tests (pg_ilib_check_header)
 -- ============================================================
 \echo '--- Validation: невозможные params должны дать ERROR ---'

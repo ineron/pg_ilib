@@ -715,29 +715,35 @@ pg_ilib_check_header(const char *caller,
 
         case 0x02: /* numeric / bigint — params = decimal scale */
         {
-            /*
-             * Each payload byte encodes at most ⌈log₁₀(256)⌉ = 3 decimal
-             * digits.  A scale larger than 3 × payload_bytes is
-             * mathematically impossible for the binary data present.
-             */
-            int max_scale = payload * 3;
-
             if (params < 0)
                 ereport(ERROR,
                         (errcode(ERRCODE_DATA_CORRUPTED),
                          errmsg("pg_ilib %s: numeric scale %d is negative",
                                 caller, (int)params)));
-            if (payload < 1)
-                ereport(ERROR,
-                        (errcode(ERRCODE_DATA_CORRUPTED),
-                         errmsg("pg_ilib %s: numeric/bigint has no payload bytes",
-                                caller)));
-            if (params > max_scale)
-                ereport(ERROR,
-                        (errcode(ERRCODE_DATA_CORRUPTED),
-                         errmsg("pg_ilib %s: numeric scale %d is impossible for "
-                                "%d payload byte(s) (max scale = %d)",
-                                caller, (int)params, payload, max_scale)));
+
+            /*
+             * A 0-byte payload is not corruption: GMP's mpz_export() returns
+             * count=0 for the value 0, so numeric_to_bytea() encodes numeric
+             * 0 as header-only (see pg_ilib.c numeric_to_bytea). mpz_import()
+             * on 0 bytes correctly yields 0 in bytea_to_numeric/bytea_to_bigint,
+             * and 0 is valid at any scale, so skip the max-scale check below.
+             */
+            if (payload > 0)
+            {
+                /*
+                 * Each payload byte encodes at most ⌈log₁₀(256)⌉ = 3 decimal
+                 * digits.  A scale larger than 3 × payload_bytes is
+                 * mathematically impossible for the binary data present.
+                 */
+                int max_scale = payload * 3;
+
+                if (params > max_scale)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("pg_ilib %s: numeric scale %d is impossible for "
+                                    "%d payload byte(s) (max scale = %d)",
+                                    caller, (int)params, payload, max_scale)));
+            }
             break;
         }
 
@@ -1097,50 +1103,51 @@ bytea_to_numeric(PG_FUNCTION_ARGS)
 Datum
 bigint_to_bytea(PG_FUNCTION_ARGS)
 {
-    bytea       *outbytea;
-    char        *ptr;
-    char        buf[bufsize+1];                /* bigger than needed, but reasonable */
-    int byte_count;
+    bytea           *outbytea;
+    unsigned char   *data;
+    int             byte_count;
+    int             i;
 
     uint64      value = (uint64)PG_GETARG_INT64(0);
-    short      params = (short)PG_GETARG_INT32(1);
-    if(value>0xffffffffffffff){
-        PG_RETURN_NULL();
-        ereport(ERROR,
-            (errcode(ERRCODE_STRING_DATA_LENGTH_MISMATCH),
-             errmsg("Input of %d bytes has be max 8 bytes (64 bits) in size", (int)VARSIZE_ANY_EXHDR(value) )));
-    }
+    short       params = (short)PG_GETARG_INT32(1);
 
+    if (value > 0xffffffffffffff)
+        ereport(ERROR,
+                (errcode(ERRCODE_STRING_DATA_LENGTH_MISMATCH),
+                 errmsg("pg_ilib bigint_to_bytea: value %lu exceeds max 7 magnitude bytes (56 bits)",
+                        (unsigned long) value)));
+
+    /* magnitude byte count, matching numeric_to_bytea's GMP export (0 bytes for value 0) */
     if(value>0xffffffffffff){
-        byte_count = 8;
-    }else if(value>0xffffffffff){
         byte_count = 7;
     }else if(value>0xffffffff){
         byte_count = 6;
     }else if(value>0xffffff){
         byte_count = 5;
     }else if(value>0xffff){
-        byte_count = 4;
-    }else if(value>0xff){
         byte_count = 3;
-    }else{
+    }else if(value>0xff){
         byte_count = 2;
+    }else if(value>0){
+        byte_count = 1;
+    }else{
+        byte_count = 0;
     }
 
-    outbytea = (bytea*)palloc(VARHDRSZ + byte_count + 1);
-    SET_VARSIZE(outbytea, VARHDRSZ + byte_count + 1);
+    /* allocate: 2-byte header (matching numeric_to_bytea) + magnitude payload */
+    outbytea = (bytea*)palloc(VARHDRSZ + 2 + byte_count);
+    SET_VARSIZE(outbytea, VARHDRSZ + 2 + byte_count);
 
-    /* write integer digits into buffer right-to-left */
-    ptr = buf+byte_count;
-    do
+    data = (unsigned char *)VARDATA(outbytea);
+    data[0] = (0x02 << 4) | ((params >> 8) & 0x0F);
+    data[1] = params & 0xFF;
+
+    /* write magnitude bytes big-endian */
+    for (i = byte_count - 1; i >= 0; i--)
     {
-        *--ptr = value % HEXBASE;
-        value /= HEXBASE;
-    } while (ptr > buf+1 && value);
-
-    /    *--ptr = 0x00;
-    *--ptr = 0x20;
-    memcpy(VARDATA(outbytea), (void*)ptr, byte_count+1);
+        data[2 + i] = value & 0xFF;
+        value >>= 8;
+    }
 
     PG_RETURN_BYTEA_P(outbytea);
 }
@@ -1375,13 +1382,14 @@ value_to_jsonb(PG_FUNCTION_ARGS)
                              ? data_len
                              : (int)params;
 
-            /* Access data directly from detoasted varlena (buf may be partial) */
-            const char *text_src = (const char *)(buf + 2);
+            /* null-terminate for escape_json, which handles JSON escaping of
+             * special chars (", \, control chars) and adds surrounding quotes */
+            char *text_copy = palloc(copy_bytes + 1);
+            memcpy(text_copy, buf + 2, copy_bytes);
+            text_copy[copy_bytes] = '\0';
 
             initStringInfo(&sbuf);
-            appendStringInfoChar(&sbuf, '"');
-            appendBinaryStringInfo(&sbuf, text_src, copy_bytes);
-            appendStringInfoChar(&sbuf, '"');
+            escape_json(&sbuf, text_copy);
         }
         PG_RETURN_JSONB_P(DirectFunctionCall1(jsonb_in, CStringGetDatum(sbuf.data)));
         break;
@@ -1530,7 +1538,7 @@ value_to_jsonb(PG_FUNCTION_ARGS)
 
         op_id = (buf[0] & MASK) >> 4;
         params = ((buf[0] & 0x0F) << 8) | buf[1];
-        
+
 
         if (op_id != 0x0e) {
             elog(ERROR, "Invalid op_id: expected 0x0e, got 0x%02x", op_id);
@@ -1538,31 +1546,31 @@ value_to_jsonb(PG_FUNCTION_ARGS)
         }
 
         /* JSONB payload size (after 2-byte header) */
-        
+
         /* reconstruct Jsonb from raw binary JSONB bytes */
         result = (Jsonb *)palloc(VARHDRSZ + byte_count - 2);
         SET_VARSIZE(result, VARHDRSZ + byte_count - 2);
         
         /* copy raw JSONB bytes */
-        memcpy(VARDATA(result), buf + 2, byte_count - 2);        PG_RETURN_JSONB_P(result);
-
+        memcpy(VARDATA(result), buf + 2, byte_count - 2);        
+        
+        PG_RETURN_JSONB_P(result);
+        
         break;
     case 0x0F: /* hex bytes */
-        memcpy(buf, VARDATA_ANY(inbytea), byte_count+1);
         initStringInfo(&sbuf);
-        appendStringInfoChar(&sbuf,34);
-        for (i = 1; i < byte_count; i++)
+        appendStringInfoChar(&sbuf, 34); /* opening '"' */
+        appendStringInfoString(&sbuf, "0x");
+        for (i = 2; i < byte_count; i++)
         {
-            int                     hi;
-            int                     lo;
-
-            hi = buf[i] >> 4;
-            lo = buf[i] & 0x0F;
-
+            int hi = buf[i] >> 4;
+            int lo = buf[i] & 0x0F;
             appendStringInfoChar(&sbuf, hex_chars[hi]);
             appendStringInfoChar(&sbuf, hex_chars[lo]);
         }
-        appendStringInfoChar(&sbuf,34);        PG_RETURN_JSONB_P(DirectFunctionCall1(jsonb_in,CStringGetDatum(sbuf.data)));
+        appendStringInfoChar(&sbuf, 34); /* closing '"' */
+
+        PG_RETURN_JSONB_P(DirectFunctionCall1(jsonb_in, CStringGetDatum(sbuf.data)));
     }
 }
 
@@ -2135,24 +2143,37 @@ date_to_bytea(PG_FUNCTION_ARGS)
     
     params = (short)timezone_offset;
     collid = DEFAULT_COLLATION_OID;    value = parse_datetime(datetime, tmplate, collid, true, &typid, &typmod, &tz, &have_error);
+
+    /* have_error was computed but never checked - a genuine parse failure
+     * and a successfully-parsed 1970-01-01 00:00:00 UTC (tm == 0, since tm
+     * is seconds-from-Unix-epoch) were indistinguishable below, so the
+     * epoch date silently encoded as NULL instead of a valid zero-value
+     * bytea. Check have_error explicitly instead of inferring failure from
+     * tm being falsy. */
+    if (have_error)
+        PG_RETURN_NULL();
+
     switch(typid){
-        case 1082: 
+        case 1082:
             tm = DatumGetTimestamp(value)
-                * 86400 
+                * 86400
                 +((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
-            
+
             break;/* Date */
-        case 1083: 
+        case 1083:
         case 1114:
         case 1184:
         case 1266:
             tm = DatumGetTimestamp(value)
-                /1000000 + 
+                /1000000 +
                 ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
             break;/* time, timestamp, same + tz */
+        default:
+            /* parse_datetime succeeded but returned a type we don't encode */
+            PG_RETURN_NULL();
     }
-    
-    if (tm){
+
+    {
         byte_count = 6;
         outbytea = (bytea*)palloc(VARHDRSZ + byte_count);
         SET_VARSIZE(outbytea, VARHDRSZ + byte_count);
@@ -2171,8 +2192,6 @@ date_to_bytea(PG_FUNCTION_ARGS)
 
         PG_RETURN_BYTEA_P(outbytea);
     }
-    else
-        PG_RETURN_NULL();
 }
 /* POSTGRES_EPOCH_JDATE = 2451545  (2000-01-01)
  * UNIX_EPOCH_JDATE     = 2440588  (1970-01-01) */

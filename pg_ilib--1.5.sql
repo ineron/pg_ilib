@@ -44,7 +44,7 @@ CREATE FUNCTION bytea_to_bigint(bytea)
     LANGUAGE c IMMUTABLE STRICT
     AS '$libdir/pg_ilib', 'bytea_to_bigint';
 
-CREATE CAST (bigint AS bytea) WITH FUNCTION bigint_to_bytea(bigint);
+CREATE CAST (bigint AS bytea) WITH FUNCTION bigint_to_bytea(bigint,int);
 CREATE CAST (bytea AS bigint) WITH FUNCTION bytea_to_bigint(bytea);
 
 -- ── numeric ───────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ CREATE FUNCTION bytea_to_numeric(bytea)
     LANGUAGE c IMMUTABLE STRICT
     AS '$libdir/pg_ilib', 'bytea_to_numeric';
 
-CREATE CAST (numeric AS bytea) WITH FUNCTION numeric_to_bytea(numeric);
+CREATE CAST (numeric AS bytea) WITH FUNCTION numeric_to_bytea(numeric, int);
 CREATE CAST (bytea AS numeric) WITH FUNCTION bytea_to_numeric(bytea);
 
 -- ── bool ──────────────────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ CREATE FUNCTION bytea_to_uuid(bytea)
     LANGUAGE c IMMUTABLE STRICT
     AS '$libdir/pg_ilib', 'bytea_to_uuid';
 
-CREATE CAST (uuid AS bytea) WITH FUNCTION uuid_to_bytea(uuid);
+CREATE CAST (uuid AS bytea) WITH FUNCTION uuid_to_bytea(uuid,int);
 CREATE CAST (bytea AS uuid) WITH FUNCTION bytea_to_uuid(bytea);
 
 -- ── hex ───────────────────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ CREATE FUNCTION bytea_to_jsonb(bytea)
     LANGUAGE c IMMUTABLE STRICT
     AS '$libdir/pg_ilib', 'bytea_to_jsonb';
 
-CREATE CAST (jsonb AS bytea) WITH FUNCTION jsonb_to_bytea(jsonb);
+CREATE CAST (jsonb AS bytea) WITH FUNCTION jsonb_to_bytea(jsonb,int);
 CREATE CAST (bytea AS jsonb) WITH FUNCTION bytea_to_jsonb(bytea);
 
 -- ── universal decoder ─────────────────────────────────────────────────────
