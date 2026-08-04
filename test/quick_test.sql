@@ -251,6 +251,92 @@ END $$;
 -- ============================================================
 
 -- ============================================================
+-- Negative numeric/bigint sign handling
+-- (bug fix 2026-08-04: op_id 0x02's params field packed only a decimal
+--  scale, so mpz_export()'s magnitude-only output round-tripped every
+--  negative value as positive with no error. Fix reserves the top bit
+--  of the 12-bit params field (0x800) as a sign flag, leaving 11 bits
+--  (0x7FF) for scale — see numeric_to_bytea/bigint_to_bytea.)
+-- ============================================================
+\echo '--- negative numeric/bigint sign handling ---'
+
+DO $$
+BEGIN
+  IF bytea_to_numeric(numeric_to_bytea(-5::numeric)) != -5 THEN
+    RAISE EXCEPTION 'TEST FAILED: numeric_to_bytea/bytea_to_numeric roundtrip for -5, got %',
+      bytea_to_numeric(numeric_to_bytea(-5::numeric));
+  END IF;
+  IF bytea_to_numeric(numeric_to_bytea(-123.45::numeric, 2)) != -123.45 THEN
+    RAISE EXCEPTION 'TEST FAILED: numeric_to_bytea/bytea_to_numeric roundtrip for -123.45';
+  END IF;
+  IF bytea_to_numeric(numeric_to_bytea(-0.001::numeric, 3)) != -0.001 THEN
+    RAISE EXCEPTION 'TEST FAILED: numeric_to_bytea/bytea_to_numeric roundtrip for -0.001 (scale > digit count)';
+  END IF;
+  IF bytea_to_numeric(numeric_to_bytea(0::numeric)) != 0 THEN
+    RAISE EXCEPTION 'TEST FAILED: numeric_to_bytea/bytea_to_numeric roundtrip for 0 regressed';
+  END IF;
+  IF bytea_to_numeric(numeric_to_bytea(5::numeric)) != 5 THEN
+    RAISE EXCEPTION 'TEST FAILED: numeric_to_bytea/bytea_to_numeric roundtrip for positive 5 regressed';
+  END IF;
+  RAISE NOTICE 'OK: numeric_to_bytea/bytea_to_numeric roundtrip preserves sign (negative, zero, positive)';
+END $$;
+
+DO $$
+BEGIN
+  IF bytea_to_bigint(bigint_to_bytea(-987654321::bigint)) != -987654321 THEN
+    RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/bytea_to_bigint roundtrip for -987654321, got %',
+      bytea_to_bigint(bigint_to_bytea(-987654321::bigint));
+  END IF;
+  RAISE NOTICE 'OK: bigint_to_bytea/bytea_to_bigint roundtrip for -987654321 (used to hard-error)';
+END $$;
+
+DO $$
+DECLARE
+  v bigint;
+  vals bigint[] := ARRAY[-1, -255, -256, -65535, -65536, -16777215, -16777216,
+                          -72057594037927935, 0, 1, 12345];
+BEGIN
+  FOREACH v IN ARRAY vals LOOP
+    IF bytea_to_bigint(bigint_to_bytea(v)) != v THEN
+      RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/bytea_to_bigint roundtrip for %, got %',
+        v, bytea_to_bigint(bigint_to_bytea(v));
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'OK: bigint_to_bytea/bytea_to_bigint roundtrip for % values incl. every magnitude-byte boundary',
+    array_length(vals, 1);
+END $$;
+
+DO $$
+BEGIN
+  PERFORM bigint_to_bytea(-9223372036854775807::bigint);
+  RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea should have rejected an oversized negative value';
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'OK: bigint_to_bytea rejected oversized negative value: %', SQLERRM;
+END $$;
+
+DO $$
+BEGIN
+  IF value_to_jsonb(numeric_to_bytea(-42.5::numeric, 1)) != to_jsonb(-42.5::numeric) THEN
+    RAISE EXCEPTION 'TEST FAILED: value_to_jsonb negative numeric, got %',
+      value_to_jsonb(numeric_to_bytea(-42.5::numeric, 1));
+  END IF;
+  IF value_to_jsonb(bigint_to_bytea(-999::bigint)) != to_jsonb(-999) THEN
+    RAISE EXCEPTION 'TEST FAILED: value_to_jsonb negative bigint, got %',
+      value_to_jsonb(bigint_to_bytea(-999::bigint));
+  END IF;
+  RAISE NOTICE 'OK: value_to_jsonb preserves sign for negative numeric and bigint';
+END $$;
+
+DO $$
+BEGIN
+  IF encode(bigint_to_bytea(-12345::bigint, 2), 'hex') != encode(numeric_to_bytea(-12345, 2), 'hex') THEN
+    RAISE EXCEPTION 'TEST FAILED: bigint_to_bytea/numeric_to_bytea byte-layout parity for negative values';
+  END IF;
+  RAISE NOTICE 'OK: bigint_to_bytea matches numeric_to_bytea byte layout for negative values';
+END $$;
+-- ============================================================
+
+-- ============================================================
 -- Validation / anti-crash tests (pg_ilib_check_header)
 -- ============================================================
 \echo '--- Validation: невозможные params должны дать ERROR ---'

@@ -9,7 +9,7 @@
  *
  * op_id table:
  *   0x01  text                params = unused
- *   0x02  numeric / bigint    params = decimal scale
+ *   0x02  numeric / bigint    params = sign bit (0x800) | decimal scale (0x7FF)
  *   0x03  bool                params = 0
  *   0x04  timestamp / date    params = signed tz offset in minutes
  *   0x08  uuid                params = 0
@@ -39,6 +39,11 @@
 #define HEXBASE         256
 #define bufsize         32
 #define ADDRESS_LEN     20
+
+/* op_id 0x02 (numeric/bigint) params field: 12 bits total, split as
+ * sign bit | 11-bit scale — see numeric_to_bytea/bigint_to_bytea. */
+#define NUMERIC_SIGN_PARAM_BIT          0x800
+#define NUMERIC_SIGN_PARAM_SCALE_MASK   0x7FF
 
 #ifdef PG_MODULE_MAGIC
     PG_MODULE_MAGIC;
@@ -713,12 +718,14 @@ pg_ilib_check_header(const char *caller,
             /* nothing to check */
             break;
 
-        case 0x02: /* numeric / bigint — params = decimal scale */
+        case 0x02: /* numeric / bigint — params = sign bit (0x800) | scale (0x7FF) */
         {
+            int scale = params & NUMERIC_SIGN_PARAM_SCALE_MASK;
+
             if (params < 0)
                 ereport(ERROR,
                         (errcode(ERRCODE_DATA_CORRUPTED),
-                         errmsg("pg_ilib %s: numeric scale %d is negative",
+                         errmsg("pg_ilib %s: numeric params %d is negative",
                                 caller, (int)params)));
 
             /*
@@ -737,12 +744,12 @@ pg_ilib_check_header(const char *caller,
                  */
                 int max_scale = payload * 3;
 
-                if (params > max_scale)
+                if (scale > max_scale)
                     ereport(ERROR,
                             (errcode(ERRCODE_DATA_CORRUPTED),
                              errmsg("pg_ilib %s: numeric scale %d is impossible for "
                                     "%d payload byte(s) (max scale = %d)",
-                                    caller, (int)params, payload, max_scale)));
+                                    caller, scale, payload, max_scale)));
             }
             break;
         }
@@ -963,6 +970,8 @@ bytea_to_bigint(PG_FUNCTION_ARGS)
         memset(char_int.buf,'\0',32);
         while(byte_count--)
             char_int.buf[byte_count] = *b++;
+        if (params_bi & NUMERIC_SIGN_PARAM_BIT)
+            PG_RETURN_INT64(-char_int.out);
         PG_RETURN_INT64(char_int.out);
     }else{
         PG_RETURN_NULL();
@@ -1000,9 +1009,21 @@ numeric_to_bytea(PG_FUNCTION_ARGS)
     mpz_set_str(a, clean_digits, 10);
     binary_data = mpz_export(NULL, &count, 1, sizeof(char), 0, 0, a);
     byte_array = (unsigned char *)binary_data;
-    
+
+    if (scale < 0 || scale > NUMERIC_SIGN_PARAM_SCALE_MASK)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_ilib numeric_to_bytea: scale %d out of range (0..%d)",
+                        scale, NUMERIC_SIGN_PARAM_SCALE_MASK)));
+
+    /* mpz_export() only ever exports the magnitude (GMP docs) — count==0
+     * for value 0, so there is nothing to carry a sign for; otherwise
+     * reapply it as a header bit since the wire format has no room to
+     * keep it in the digit string itself. */
     params = (short)scale;
-    
+    if (count > 0 && x.sign == NUMERIC_NEG)
+        params |= NUMERIC_SIGN_PARAM_BIT;
+
     /* allocate: 2-byte header + GMP payload */
     result = (bytea *)palloc(VARHDRSZ + 2 + count);
     SET_VARSIZE(result, VARHDRSZ + 2 + count);
@@ -1054,6 +1075,11 @@ bytea_to_numeric(PG_FUNCTION_ARGS)
     pg_ilib_check_header("bytea_to_numeric", op_id, params,
                          VARSIZE_ANY_EXHDR(inbytea));
 
+    {
+        bool is_negative = (params & NUMERIC_SIGN_PARAM_BIT) != 0;
+        int  scale = params & NUMERIC_SIGN_PARAM_SCALE_MASK;
+        const char *sign_prefix = is_negative ? "-" : "";
+
     bbuf+=2;
     str = bbuf;
     /* reconstruct integer from big-endian payload bytes via GMP */
@@ -1065,36 +1091,48 @@ bytea_to_numeric(PG_FUNCTION_ARGS)
     /* insert decimal point at the correct position */
     init_var(&result);
 
-    if (params > 0) {
+    if (scale > 0) {
         size_t len = strlen(binary_str);
         char *decimal_str;
 
-        if (params >= len) {
+        if (scale >= len) {
                 /* fewer digits than scale: e.g. 123 with scale=5 → "0.00123" */
-                int zeros_needed = params - len;
-                decimal_str = palloc(3 + zeros_needed + len);
-                strcpy(decimal_str, "0.");
+                int zeros_needed = scale - len;
+                decimal_str = palloc(strlen(sign_prefix) + 3 + zeros_needed + len);
+                strcpy(decimal_str, sign_prefix);
+                strcat(decimal_str, "0.");
                 for (int i = 0; i < zeros_needed; i++) {
-                decimal_str[2 + i] = '0';
+                decimal_str[strlen(sign_prefix) + 2 + i] = '0';
                 }
-                strcpy(decimal_str + 2 + zeros_needed, binary_str);
+                strcpy(decimal_str + strlen(sign_prefix) + 2 + zeros_needed, binary_str);
         } else {
                 /* insert decimal point inside: e.g. 12345 scale=2 → "123.45" */
-                decimal_str = palloc(len + 2);
-                size_t int_part_len = len - params;
-                memcpy(decimal_str, binary_str, int_part_len);
-                decimal_str[int_part_len] = '.';
-                memcpy(decimal_str + int_part_len + 1, binary_str + int_part_len, params);
-                decimal_str[len + 1] = '\0';
+                size_t prefix_len = strlen(sign_prefix);
+                decimal_str = palloc(prefix_len + len + 2);
+                size_t int_part_len = len - scale;
+                strcpy(decimal_str, sign_prefix);
+                memcpy(decimal_str + prefix_len, binary_str, int_part_len);
+                decimal_str[prefix_len + int_part_len] = '.';
+                memcpy(decimal_str + prefix_len + int_part_len + 1, binary_str + int_part_len, scale);
+                decimal_str[prefix_len + len + 1] = '\0';
         }
 
         (void) set_var_from_str(decimal_str, decimal_str, &result);
         pfree(decimal_str);
     } else {
-        /* params == 0: integer — return as-is */
-        (void) set_var_from_str(binary_str, binary_str, &result);
+        /* scale == 0: integer — reapply sign, if any, then return as-is */
+        if (is_negative) {
+            char *signed_str = palloc(strlen(binary_str) + 2);
+            strcpy(signed_str, "-");
+            strcat(signed_str, binary_str);
+            (void) set_var_from_str(signed_str, signed_str, &result);
+            pfree(signed_str);
+        } else {
+            (void) set_var_from_str(binary_str, binary_str, &result);
+        }
     }
     res = make_result(&result);
+    }
 
     free_var(&result);
     PG_RETURN_NUMERIC(res);
@@ -1108,14 +1146,28 @@ bigint_to_bytea(PG_FUNCTION_ARGS)
     int             byte_count;
     int             i;
 
-    uint64      value = (uint64)PG_GETARG_INT64(0);
-    short       params = (short)PG_GETARG_INT32(1);
+    int64       arg = PG_GETARG_INT64(0);
+    int32       scale = PG_GETARG_INT32(1);
+    bool        is_negative = (arg < 0);
+    /* abs(INT64_MIN) overflows int64 but fits uint64, so negate in unsigned. */
+    uint64      value = is_negative ? (uint64)(-(uint64)arg) : (uint64)arg;
+    short       params;
+
+    if (scale < 0 || scale > NUMERIC_SIGN_PARAM_SCALE_MASK)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_ilib bigint_to_bytea: scale %d out of range (0..%d)",
+                        scale, NUMERIC_SIGN_PARAM_SCALE_MASK)));
+
+    params = (short)scale;
+    if (value > 0 && is_negative)
+        params |= NUMERIC_SIGN_PARAM_BIT;
 
     if (value > 0xffffffffffffff)
         ereport(ERROR,
                 (errcode(ERRCODE_STRING_DATA_LENGTH_MISMATCH),
-                 errmsg("pg_ilib bigint_to_bytea: value %lu exceeds max 7 magnitude bytes (56 bits)",
-                        (unsigned long) value)));
+                 errmsg("pg_ilib bigint_to_bytea: value %s%lu exceeds max 7 magnitude bytes (56 bits)",
+                        is_negative ? "-" : "", (unsigned long) value)));
 
     /* magnitude byte count, matching numeric_to_bytea's GMP export (0 bytes for value 0) */
     if(value>0xffffffffffff){
@@ -1393,45 +1445,59 @@ value_to_jsonb(PG_FUNCTION_ARGS)
         }
         PG_RETURN_JSONB_P(DirectFunctionCall1(jsonb_in, CStringGetDatum(sbuf.data)));
         break;
-    case 0x02: /* bigint */
-        {            
+    case 0x02: /* bigint / numeric */
+        {
             mpz_t big_number;
             char *binary_str;
+            bool  is_negative = (params & NUMERIC_SIGN_PARAM_BIT) != 0;
+            int   scale = params & NUMERIC_SIGN_PARAM_SCALE_MASK;
+            const char *sign_prefix = is_negative ? "-" : "";
+
             mpz_init(big_number);
             mpz_import(big_number, byte_count-2, 1, sizeof(buf[0]), 0, 0, &buf[2]);
-            
+
 
             binary_str = mpz_get_str(NULL, 10, big_number);
             mpz_clear(big_number);
 
-            if (params > 0) {
+            if (scale > 0) {
                 size_t len = strlen(binary_str);
+                size_t prefix_len = strlen(sign_prefix);
                 char *decimal_str;
 
-                if (params >= len) {
+                if (scale >= len) {
                     /* fewer digits than scale: e.g. 123 with scale=5 → "0.00123" */
-                    int zeros_needed = params - len;
-                    decimal_str = palloc(3 + zeros_needed + len);
-                    strcpy(decimal_str, "0.");
+                    int zeros_needed = scale - len;
+                    decimal_str = palloc(prefix_len + 3 + zeros_needed + len);
+                    strcpy(decimal_str, sign_prefix);
+                    strcat(decimal_str, "0.");
                     for (int i = 0; i < zeros_needed; i++) {
-                        decimal_str[2 + i] = '0';
+                        decimal_str[prefix_len + 2 + i] = '0';
                     }
-                    strcpy(decimal_str + 2 + zeros_needed, binary_str);
+                    strcpy(decimal_str + prefix_len + 2 + zeros_needed, binary_str);
                 } else {
                     /* insert decimal point inside: e.g. 12345 scale=2 → "123.45" */
-                    decimal_str = palloc(len + 2);
-                    size_t int_part_len = len - params;
-                    memcpy(decimal_str, binary_str, int_part_len);
-                    decimal_str[int_part_len] = '.';
-                    memcpy(decimal_str + int_part_len + 1, binary_str + int_part_len, params);
-                    decimal_str[len + 1] = '\0';
+                    decimal_str = palloc(prefix_len + len + 2);
+                    size_t int_part_len = len - scale;
+                    strcpy(decimal_str, sign_prefix);
+                    memcpy(decimal_str + prefix_len, binary_str, int_part_len);
+                    decimal_str[prefix_len + int_part_len] = '.';
+                    memcpy(decimal_str + prefix_len + int_part_len + 1, binary_str + int_part_len, scale);
+                    decimal_str[prefix_len + len + 1] = '\0';
                 }
 
                 res = decimal_str;
                 free(binary_str); /* free GMP-allocated string */
+            } else if (is_negative) {
+                /* scale == 0: integer — reapply sign, then copy into palloc
+                 * memory so we can free the GMP string */
+                char *signed_str = palloc(strlen(binary_str) + 2);
+                strcpy(signed_str, "-");
+                strcat(signed_str, binary_str);
+                res = signed_str;
+                free(binary_str);
             } else {
-                /* params == 0: integer — return as-is */
-                /* copy into palloc memory so we can free the GMP string */
+                /* scale == 0, non-negative: integer — return as-is */
                 res = pstrdup(binary_str);
                 free(binary_str);
             }
