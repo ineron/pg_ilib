@@ -729,28 +729,16 @@ pg_ilib_check_header(const char *caller,
                                 caller, (int)params)));
 
             /*
-             * A 0-byte payload is not corruption: GMP's mpz_export() returns
-             * count=0 for the value 0, so numeric_to_bytea() encodes numeric
-             * 0 as header-only (see pg_ilib.c numeric_to_bytea). mpz_import()
-             * on 0 bytes correctly yields 0 in bytea_to_numeric/bytea_to_bigint,
-             * and 0 is valid at any scale, so skip the max-scale check below.
+             * No payload-size vs. scale check: the payload is an unsigned
+             * magnitude and scale is independent of it.  A value with zeros
+             * right after the decimal point (0.0001 @ scale 4 = payload 0x01)
+             * legitimately has far fewer significant digits than its scale,
+             * and 0 is header-only (GMP mpz_export() yields 0 bytes).  The
+             * former "scale <= 3 * payload" check rejected valid data.
+             * (void) silences unused-variable warnings.
              */
-            if (payload > 0)
-            {
-                /*
-                 * Each payload byte encodes at most ⌈log₁₀(256)⌉ = 3 decimal
-                 * digits.  A scale larger than 3 × payload_bytes is
-                 * mathematically impossible for the binary data present.
-                 */
-                int max_scale = payload * 3;
-
-                if (scale > max_scale)
-                    ereport(ERROR,
-                            (errcode(ERRCODE_DATA_CORRUPTED),
-                             errmsg("pg_ilib %s: numeric scale %d is impossible for "
-                                    "%d payload byte(s) (max scale = %d)",
-                                    caller, scale, payload, max_scale)));
-            }
+            (void) scale;
+            (void) payload;
             break;
         }
 
@@ -2338,8 +2326,11 @@ cmp_date(PG_FUNCTION_ARGS)
              errmsg("Input of %d bytes has be max 4 bytes (32 bits) in size", (int)VARSIZE_ANY_EXHDR(right_arg) )));
     }
     
-    memcpy(lbuf, VARDATA_ANY(left_arg),byte_count);
-    memcpy(rbuf, VARDATA_ANY(right_arg),byte_count);
+    /* each operand is copied with its OWN length (was: right's length for both) */
+    memset(lbuf, 0, sizeof(lbuf));
+    memset(rbuf, 0, sizeof(rbuf));
+    memcpy(lbuf, VARDATA_ANY(left_arg), Min(VARSIZE_ANY_EXHDR(left_arg), sizeof(lbuf)));
+    memcpy(rbuf, VARDATA_ANY(right_arg), Min(VARSIZE_ANY_EXHDR(right_arg), sizeof(rbuf)));
     
     
     if((lbuf[0]|0x60)!=0x60){

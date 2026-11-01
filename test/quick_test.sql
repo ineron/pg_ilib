@@ -341,15 +341,24 @@ END $$;
 -- ============================================================
 \echo '--- Validation: невозможные params должны дать ERROR ---'
 
--- numeric: scale=0xFFF=4095 при payload=1 байт → невозможно (max scale=3)
--- Ожидаем ERROR: numeric scale 4095 is impossible for 1 payload byte(s)
+-- numeric: scale больше числа цифр payload — ЗАКОННО (0.0001 @ scale 4 = 1 байт).
+-- Раньше проверка "scale <= 3*payload" ошибочно отвергала такие значения
+-- (отчёт pg_ipl, thread 999).
 DO $$
+DECLARE
+  v numeric;
+  c numeric[] := ARRAY[0.0001, 0.0050, 0.0255, 0.01, 0.0256, -0.0001, 0.000001];
+  s int[]     := ARRAY[4,      4,      4,      2,    4,      4,       6];
 BEGIN
-  PERFORM bytea_to_numeric('\x2F002a'::bytea);  -- op_id=0x02, params=0xF00 -> scale=3840
-  RAISE EXCEPTION 'TEST FAILED: should have raised DATA_CORRUPTED';
-EXCEPTION WHEN others THEN
-  RAISE NOTICE 'OK: bytea_to_numeric rejected impossible scale: %', SQLERRM;
+  FOR i IN 1..array_length(c,1) LOOP
+    v := bytea_to_numeric(numeric_to_bytea(c[i], s[i]));
+    IF v IS DISTINCT FROM c[i] THEN
+      RAISE EXCEPTION 'TEST FAILED: numeric roundtrip % @ scale % gave %', c[i], s[i], v;
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'OK: numeric values with scale > payload digits roundtrip';
 END $$;
+
 
 -- timestamp: tz offset=0xFFF=4095 минут → вне диапазона [-840,840]
 -- Ожидаем ERROR: timezone offset 4095 min is out of valid range
